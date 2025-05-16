@@ -1,0 +1,393 @@
+#include "interpolation.h"
+#include "motor.h"
+#include "usart.h"
+#include "stdio.h"
+#include "math.h"
+#include "stdlib.h"
+#include "stm32f10x.h"
+
+// 全局变量
+static InterpolationType_TypeDef current_interpolation_type = INTERPOLATION_LINEAR;
+static u8 interpolation_running = 0;
+static u8 interpolation_paused = 0;
+
+// 直线插补和圆弧插补参数
+static LinearInterpolation_TypeDef linear_params;
+static CircularInterpolation_TypeDef circular_params;
+
+/**
+ * @brief 初始化插补系统
+ */
+void Interpolation_Init(void)
+{
+    // 初始化PWM定时器
+    TIM8_PWM_Init(1000); // 默认速度
+    
+    // 初始化方向控制引脚
+    GPIO_InitTypeDef GPIO_InitStructure;
+    
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    
+    // 关闭插补输出
+    TIM_Cmd(TIM8, DISABLE);
+    
+    // 初始化状态变量
+    interpolation_running = 0;
+    interpolation_paused = 0;
+}
+
+/**
+ * @brief 设置电机方向
+ * @param x_dir X轴方向
+ * @param y_dir Y轴方向
+ */
+static void Set_Direction(Direction_TypeDef x_dir, Direction_TypeDef y_dir)
+{
+    // 设置X轴方向
+    if (x_dir == DIR_POSITIVE) {
+        GPIO_ResetBits(GPIOA, GPIO_Pin_1); // X轴正向
+    } else {
+        GPIO_SetBits(GPIOA, GPIO_Pin_1);   // X轴负向
+    }
+    
+    // Y轴方向控制可以在这里添加
+    // ...
+}
+
+/**
+ * @brief 计算两点之间的直线插补参数
+ * @param start 起点坐标
+ * @param end 终点坐标
+ * @return 直线插补参数
+ */
+static LinearInterpolation_TypeDef Calculate_Linear_Params(Point_TypeDef start, Point_TypeDef end)
+{
+    LinearInterpolation_TypeDef params;
+    
+    // 保存起点和终点
+    params.start = start;
+    params.end = end;
+    params.current = start;
+    
+    // 计算增量
+    params.dx = abs(end.x - start.x);
+    params.dy = abs(end.y - start.y);
+    
+    // 计算总步数（取最大增量）
+    params.steps = (params.dx > params.dy) ? params.dx : params.dy;
+    
+    // 初始化误差项
+    params.error = params.dx - params.dy;
+    
+    return params;
+}
+
+/**
+ * @brief 计算圆弧插补参数
+ * @param start 起点坐标
+ * @param end 终点坐标
+ * @param center 圆心坐标
+ * @param direction 圆弧方向
+ * @return 圆弧插补参数
+ */
+static CircularInterpolation_TypeDef Calculate_Circular_Params(Point_TypeDef start, Point_TypeDef end, Point_TypeDef center, ArcDirection_TypeDef direction)
+{
+    CircularInterpolation_TypeDef params;
+    
+    // 保存基本参数
+    params.start = start;
+    params.end = end;
+    params.center = center;
+    params.current = start;
+    params.direction = direction;
+    
+    // 计算半径（使用起点到圆心的距离）
+    int dx = start.x - center.x;
+    int dy = start.y - center.y;
+    params.radius = (int)sqrt(dx*dx + dy*dy);
+    
+    // 初始化误差项（使用中点圆弧算法的初始误差）
+    params.error = 1 - params.radius;
+    
+    // 估算步数（使用圆周长的一部分）
+    // 计算起点和终点的角度
+    float start_angle = atan2f(start.y - center.y, start.x - center.x);
+    float end_angle = atan2f(end.y - center.y, end.x - center.x);
+    
+    // 根据方向调整角度差
+    float angle_diff;
+    if (direction == CW) {
+        angle_diff = (start_angle <= end_angle) ? (2*3.14159f - (end_angle - start_angle)) : (start_angle - end_angle);
+    } else {
+        angle_diff = (end_angle <= start_angle) ? (2*3.14159f - (start_angle - end_angle)) : (end_angle - start_angle);
+    }
+    
+    // 估算步数
+    params.steps = (int)(angle_diff * params.radius);
+    
+    return params;
+}
+
+/**
+ * @brief 执行直线插补的一步
+ * @return 1表示插补完成，0表示未完成
+ */
+static u8 Linear_Interpolation_Step(void)
+{
+    // 检查是否已完成
+    if (linear_params.current.x == linear_params.end.x && 
+        linear_params.current.y == linear_params.end.y) {
+        return 1;
+    }
+    
+    // 计算X轴和Y轴的方向
+    Direction_TypeDef x_dir = (linear_params.end.x >= linear_params.start.x) ? DIR_POSITIVE : DIR_NEGATIVE;
+    Direction_TypeDef y_dir = (linear_params.end.y >= linear_params.start.y) ? DIR_POSITIVE : DIR_NEGATIVE;
+    
+    // 根据误差决定移动哪个轴
+    if (2 * linear_params.error > -linear_params.dy) {
+        // 向X轴方向移动
+        linear_params.error -= linear_params.dy;
+        linear_params.current.x += (x_dir == DIR_POSITIVE) ? 1 : -1;
+        
+        // 设置X轴方向和脉冲
+        Set_Direction(x_dir, y_dir);
+        TIM_CCxCmd(TIM8, TIM_Channel_2, TIM_CCx_Enable);
+        TIM_CCxCmd(TIM8, TIM_Channel_3, TIM_CCx_Disable);
+    }
+    
+    if (2 * linear_params.error < linear_params.dx) {
+        // 向Y轴方向移动
+        linear_params.error += linear_params.dx;
+        linear_params.current.y += (y_dir == DIR_POSITIVE) ? 1 : -1;
+        
+        // 设置Y轴方向和脉冲
+        Set_Direction(x_dir, y_dir);
+        TIM_CCxCmd(TIM8, TIM_Channel_2, TIM_CCx_Disable);
+        TIM_CCxCmd(TIM8, TIM_Channel_3, TIM_CCx_Enable);
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief 执行圆弧插补的一步
+ * @return 1表示插补完成，0表示未完成
+ */
+static u8 Circular_Interpolation_Step(void)
+{
+    // 检查是否已完成
+    if (circular_params.current.x == circular_params.end.x && 
+        circular_params.current.y == circular_params.end.y) {
+        return 1;
+    }
+    
+    // 计算当前点相对于圆心的位置
+    int x = circular_params.current.x - circular_params.center.x;
+    int y = circular_params.current.y - circular_params.center.y;
+    
+    // 根据圆弧方向和当前位置决定下一步移动
+    if (circular_params.direction == CW) {
+        // 顺时针方向
+        if (circular_params.error < 0) {
+            // 向内移动
+            circular_params.error += 2 * x + 1;
+            x--;
+        } else {
+            // 向外移动
+            circular_params.error += 2 * (x - y) + 1;
+            x--;
+            y++;
+        }
+    } else {
+        // 逆时针方向
+        if (circular_params.error < 0) {
+            // 向内移动
+            circular_params.error += 2 * y + 1;
+            y++;
+        } else {
+            // 向外移动
+            circular_params.error += 2 * (y - x) + 1;
+            y++;
+            x--;
+        }
+    }
+    
+    // 更新当前位置
+    circular_params.current.x = circular_params.center.x + x;
+    circular_params.current.y = circular_params.center.y + y;
+    
+    // 设置方向和脉冲
+    // 这里需要根据象限和移动方向来确定具体的电机方向
+    // 简化版本：
+    Direction_TypeDef x_dir = (x >= 0) ? DIR_POSITIVE : DIR_NEGATIVE;
+    Direction_TypeDef y_dir = (y >= 0) ? DIR_POSITIVE : DIR_NEGATIVE;
+    
+    if (x != 0) {
+        // X轴移动
+        Set_Direction(x_dir, y_dir);
+        TIM_CCxCmd(TIM8, TIM_Channel_2, TIM_CCx_Enable);
+        TIM_CCxCmd(TIM8, TIM_Channel_3, TIM_CCx_Disable);
+    } else if (y != 0) {
+        // Y轴移动
+        Set_Direction(x_dir, y_dir);
+        TIM_CCxCmd(TIM8, TIM_Channel_2, TIM_CCx_Disable);
+        TIM_CCxCmd(TIM8, TIM_Channel_3, TIM_CCx_Enable);
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief 执行直线插补
+ * @param start 起点坐标
+ * @param end 终点坐标
+ * @param speed 速度
+ */
+void Linear_Interpolation(Point_TypeDef start, Point_TypeDef end, int speed)
+{
+    // 计算插补参数
+    linear_params = Calculate_Linear_Params(start, end);
+    linear_params.speed = speed;
+    
+    // 设置插补类型
+    current_interpolation_type = INTERPOLATION_LINEAR;
+    
+    // 设置定时器速度
+    TIM8_PWM_Init(speed);
+    
+    // 启动插补
+    interpolation_running = 1;
+    interpolation_paused = 0;
+    
+    // 使能定时器
+    TIM_Cmd(TIM8, ENABLE);
+}
+
+/**
+ * @brief 执行圆弧插补
+ * @param start 起点坐标
+ * @param end 终点坐标
+ * @param center 圆心坐标
+ * @param direction 圆弧方向
+ * @param speed 速度
+ */
+void Circular_Interpolation(Point_TypeDef start, Point_TypeDef end, Point_TypeDef center, ArcDirection_TypeDef direction, int speed)
+{
+    // 检查起点和终点是否在同一个圆上
+    int r1_squared = (start.x - center.x) * (start.x - center.x) + 
+                     (start.y - center.y) * (start.y - center.y);
+    int r2_squared = (end.x - center.x) * (end.x - center.x) + 
+                     (end.y - center.y) * (end.y - center.y);
+    
+    // 允许一定的误差
+    if (abs(r1_squared - r2_squared) > (r1_squared / 100)) {
+        printf("错误：起点和终点不在同一个圆上\r\n");
+        return;
+    }
+    
+    // 计算插补参数
+    circular_params = Calculate_Circular_Params(start, end, center, direction);
+    circular_params.speed = speed;
+    
+    // 设置插补类型
+    current_interpolation_type = INTERPOLATION_CIRCULAR;
+    
+    // 设置定时器速度
+    TIM8_PWM_Init(speed);
+    
+    // 启动插补
+    interpolation_running = 1;
+    interpolation_paused = 0;
+    
+    // 使能定时器
+    TIM_Cmd(TIM8, ENABLE);
+}
+
+/**
+ * @brief 停止插补
+ */
+void Interpolation_Stop(void)
+{
+    // 停止定时器
+    TIM_Cmd(TIM8, DISABLE);
+    
+    // 关闭脉冲输出
+    TIM_CCxCmd(TIM8, TIM_Channel_2, TIM_CCx_Disable);
+    TIM_CCxCmd(TIM8, TIM_Channel_3, TIM_CCx_Disable);
+    
+    // 更新状态
+    interpolation_running = 0;
+    interpolation_paused = 0;
+}
+
+/**
+ * @brief 暂停插补
+ */
+void Interpolation_Pause(void)
+{
+    if (interpolation_running && !interpolation_paused) {
+        // 停止定时器
+        TIM_Cmd(TIM8, DISABLE);
+        
+        // 更新状态
+        interpolation_paused = 1;
+    }
+}
+
+/**
+ * @brief 恢复插补
+ */
+void Interpolation_Resume(void)
+{
+    if (interpolation_running && interpolation_paused) {
+        // 启动定时器
+        TIM_Cmd(TIM8, ENABLE);
+        
+        // 更新状态
+        interpolation_paused = 0;
+    }
+}
+
+/**
+ * @brief 检查插补是否完成
+ * @return 1表示完成，0表示未完成
+ */
+int Interpolation_IsFinished(void)
+{
+    return !interpolation_running;
+}
+
+/**
+ * @brief 定时器8中断处理函数
+ */
+void TIM8_UP_IRQHandler(void)
+{
+    if (TIM_GetITStatus(TIM8, TIM_IT_Update) != RESET) {
+        // 清除中断标志
+        TIM_ClearITPendingBit(TIM8, TIM_IT_Update);
+        
+        // 如果插补已暂停或停止，则不执行后续操作
+        if (!interpolation_running || interpolation_paused) {
+            return;
+        }
+        
+        // 根据插补类型执行相应的步进
+        u8 finished = 0;
+        if (current_interpolation_type == INTERPOLATION_LINEAR) {
+            finished = Linear_Interpolation_Step();
+        } else {
+            finished = Circular_Interpolation_Step();
+        }
+        
+        // 如果插补完成，停止定时器
+        if (finished) {
+            Interpolation_Stop();
+        }
+    }
+}
